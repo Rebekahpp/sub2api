@@ -58,6 +58,7 @@ class LocalHostTest(unittest.TestCase):
                                      'sha256': local.hashlib.sha256(binary.read_bytes()).hexdigest(),
                                      'apply': True, 'include_node1_archive': False})()
             with mock.patch.object(local, 'BASE', root/'base'), \
+                 mock.patch.object(local, 'ARCHIVE_POLICY', root/'missing-policy'), \
                  mock.patch.object(local, 'STATE', root/'state'), \
                  mock.patch.object(local.socket, 'gethostname', return_value='fixture-host'), \
                  mock.patch.object(local, 'require_legacy_paused'), \
@@ -90,6 +91,10 @@ class LocalHostTest(unittest.TestCase):
             config = json.loads((bundle/'config.json').read_text())
             self.assertEqual(config['node1_environment'], 'cn-prod')
             self.assertEqual(config['phases'], ['provision', 'cleanup', 'archive'])
+            self.assertEqual(
+                (bundle/'backup'/'node1_storage_policy.py').read_bytes(),
+                (Path(__file__).resolve().parents[1] / 'backup' / 'node1_storage_policy.py').read_bytes(),
+            )
 
     def test_active_legacy_owner_blocks_local_work(self):
         with mock.patch.object(local, 'invoke', side_effect=['ActiveState=active\nUnitFileState=enabled\n', 'inactive']):
