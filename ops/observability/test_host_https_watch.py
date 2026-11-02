@@ -236,6 +236,27 @@ class PhysicalBackupWatchTest(unittest.TestCase):
             self.assertFalse(fact['healthy'])
             self.assertEqual(fact['severity'], 'error')
 
+    def test_wal_archive_failing_is_a_hard_fault_with_its_reason_visible(self):
+        # A failing archive_command must stay an error and must say so. The
+        # watcher surfaces the reason verbatim, which is what tells the operator
+        # it is WAL archiving rather than a repository problem.
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / 'health.json'
+            path.write_text(json.dumps({
+                'status': 'degraded',
+                'observed_at': 990,
+                'reasons': ['wal_archive_failing'],
+                'wal_archive_failing': {
+                    'last_archived_wal': '000000010000001600000030',
+                    'last_failed_wal': '000000010000001600000031',
+                },
+            }))
+            fact = watch.physical_backup_fact(path, 1000)
+            self.assertFalse(fact['healthy'])
+            self.assertEqual(fact['severity'], 'error')
+            self.assertIn('wal_archive_failing', fact['reason'])
+
     def test_check_command_failure_is_a_hard_fault_not_an_advisory(self):
         # The producer writes this receipt when `pgbackrest check` itself blew
         # up. It must NOT reach the advisory band that bootstrapping uses: a

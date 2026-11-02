@@ -8,6 +8,29 @@ sys.path.insert(0, str(Path(__file__).parent))
 import tencent_pgbackrest as runner
 
 
+# Archiving succeeded after the last failure -- the cumulative counter stays
+# non-zero, exactly like cn-prod after its 2026-11-02 incident.
+_ARCHIVER_OK = json.dumps({
+    "last_archived_wal": "000000010000001600000063",
+    "last_archived_time": "2026-11-02T16:40:29+08:00",
+    "last_failed_wal": "000000010000001600000031",
+    "last_failed_time": "2026-11-02T14:32:51+08:00",
+    "archived_count": 5856, "failed_count": 15,
+    "stats_reset": "2026-10-22T21:47:26+08:00",
+    "archiving_now": True,
+})
+# The archive_command is failing right now.
+_ARCHIVER_FAILING = json.dumps({
+    "last_archived_wal": "000000010000001600000030",
+    "last_archived_time": "2026-11-02T14:25:51+08:00",
+    "last_failed_wal": "000000010000001600000031",
+    "last_failed_time": "2026-11-02T14:32:51+08:00",
+    "archived_count": 5841, "failed_count": 15,
+    "stats_reset": "2026-10-22T21:47:26+08:00",
+    "archiving_now": False,
+})
+
+
 class _Lock:
     def close(self):
         pass
@@ -141,7 +164,7 @@ class TencentPgBackrestTests(TestCase):
         with patch.object(runner, "exclusive", return_value=_Lock()), \
              patch.object(runner, "repo2_enabled", return_value=True), \
              patch.object(runner, "backrest", side_effect=fake_backrest), \
-             patch.object(runner, "run", return_value='{"last_archived_wal": "wal", "last_archived_time": null, "failed_count": 0}'), \
+             patch.object(runner, "run", return_value=_ARCHIVER_OK), \
              patch.object(runner, "atomic_json"):
             runner.cmd_check()
 
@@ -149,7 +172,7 @@ class TencentPgBackrestTests(TestCase):
         self.assertNotIn(("--repo=1", "check"), calls)
         self.assertNotIn(("--repo=2", "check"), calls)
 
-    def _run_check(self, repo_infos, failed_count=0):
+    def _run_check(self, repo_infos, archiving_now=True):
         """Drive cmd_check against per-repository info, returning the receipt."""
         written = {}
 
@@ -161,10 +184,9 @@ class TencentPgBackrestTests(TestCase):
                 return ""
             raise AssertionError(args)
 
-        archiver = ('{"last_archived_wal": "wal", "last_archived_time": null,'
-                    f' "failed_count": {failed_count}}}')
+        archiver = _ARCHIVER_OK if archiving_now else _ARCHIVER_FAILING
         with patch.object(runner, "exclusive", return_value=_Lock()), \
-             patch.object(runner, "repo2_enabled", return_value=True), \
+             patch.object(runner, "repo2_enabled", return_value=2 in repo_infos), \
              patch.object(runner, "backrest", side_effect=fake_backrest), \
              patch.object(runner, "run", return_value=archiver), \
              patch.object(runner, "atomic_json",
@@ -208,7 +230,9 @@ class TencentPgBackrestTests(TestCase):
 
         self.assertEqual(code, 2)
         self.assertEqual(receipt["status"], "degraded")
-        self.assertNotIn("reasons", receipt)
+        self.assertEqual(receipt["reasons"], ["repository_failed"])
+        self.assertNotIn("repository_bootstrapping", receipt["reasons"])
+        self.assertEqual(receipt["repository_failed"]["repositories"], [2])
         self.assertEqual(receipt["repositories"][1], {"repo": 2, "status": "failed"})
 
     def test_primary_repository_never_gets_the_bootstrap_exemption(self):
@@ -221,18 +245,22 @@ class TencentPgBackrestTests(TestCase):
         })
 
         self.assertEqual(code, 2)
-        self.assertNotIn("reasons", receipt)
+        self.assertEqual(receipt["reasons"], ["repository_failed"])
+        self.assertNotIn("repository_bootstrapping", receipt["reasons"])
+        self.assertEqual(receipt["repository_failed"]["repositories"], [1])
         self.assertEqual(receipt["repositories"][0], {"repo": 1, "status": "failed"})
 
     def test_bootstrap_does_not_excuse_wal_archive_failures(self):
         receipt, code = self._run_check({
             1: {"name": "tokenkey", "status": {"code": 0}, "backup": []},
             2: {"name": "tokenkey", "status": {"code": 2}, "backup": []},
-        }, failed_count=3)
+        }, archiving_now=False)
 
         self.assertEqual(code, 2)
         self.assertEqual(receipt["status"], "degraded")
-        self.assertNotIn("reasons", receipt)
+        # Bootstrap never excuses a failing archive_command.
+        self.assertEqual(receipt["reasons"], ["wal_archive_failing"])
+        self.assertNotIn("repository_bootstrapping", receipt["reasons"])
 
     def test_check_failure_still_writes_a_diagnosable_receipt(self):
         # A missing receipt is indistinguishable from a dead timer to the
@@ -276,3 +304,59 @@ class TencentPgBackrestTests(TestCase):
                   / "ops" / "observability" / "host_https_watch.py").read_text()
         self.assertIn('"repository_bootstrapping": "repository_bootstrapping",', source)
         self.assertNotIn('"check_command_failed":', source)
+
+    def test_recovered_host_is_ok_despite_a_nonzero_cumulative_failed_count(self):
+        # The regression this fixes: pg_stat_archiver counters are cumulative
+        # since stats_reset, so `failed_count == 0` asks "has this host ever
+        # failed to archive". cn-prod answered no forever after a 3-minute
+        # incident left failed_count at 15 -- every repository read code 0,
+        # archiving had recovered, and the receipt still said degraded on every
+        # run, with no reason attached and no way to clear short of resetting
+        # Postgres statistics.
+        receipt, code = self._run_check({
+            1: {"name": "tokenkey", "status": {"code": 0},
+                "backup": [{"label": "a", "type": "full", "timestamp": {"stop": 1}}]},
+        })
+
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["status"], "ok")
+        self.assertNotIn("reasons", receipt)
+        self.assertEqual(receipt["archiver"]["failed_count"], 15,
+                         "the cumulative counter stays in the receipt as evidence")
+
+    def test_a_degraded_receipt_always_names_a_reason(self):
+        # A bare "degraded" tells the watcher something is wrong but not what,
+        # which is barely better than a missing receipt. Guard the invariant for
+        # every non-ok path rather than trusting each new branch to remember.
+        for label, infos, archiving in (
+            ("repository failed", {1: {"name": "tokenkey", "status": {"code": 1}, "backup": []}}, True),
+            ("archive failing", {1: {"name": "tokenkey", "status": {"code": 0},
+                                     "backup": [{"label": "a", "type": "full", "timestamp": {"stop": 1}}]}}, False),
+        ):
+            with self.subTest(label):
+                receipt, code = self._run_check(infos, archiving_now=archiving)
+                self.assertEqual(receipt["status"], "degraded")
+                self.assertTrue(receipt.get("reasons"), "degraded must name a reason")
+                self.assertEqual(code, 2)
+                for reason in receipt["reasons"]:
+                    self.assertIn(reason, receipt, "each reason needs its evidence object")
+
+    def test_archiver_healthy_compares_instants_not_strings(self):
+        # Equal-looking timestamps can carry different UTC offsets, where
+        # lexical order inverts the real one.
+        self.assertFalse(runner.archiver_healthy({
+            "last_archived_time": "2026-11-02T00:30:00+08:00",   # 2026-11-01T16:30Z
+            "last_failed_time": "2026-11-01T20:00:00+00:00",     # later in reality
+        }))
+        self.assertTrue(runner.archiver_healthy({
+            "last_archived_time": "2026-11-02 16:40:29+08",      # psql spacing
+            "last_failed_time": "2026-11-02 14:32:51+08",
+        }))
+        # A host that has never failed is healthy once it has archived.
+        self.assertTrue(runner.archiver_healthy(
+            {"last_archived_time": "2026-11-02T16:00:00+08:00", "last_failed_time": None}))
+        self.assertFalse(runner.archiver_healthy(
+            {"last_archived_time": None, "last_failed_time": None}))
+        # Unparseable input must not pass as healthy.
+        self.assertFalse(runner.archiver_healthy(
+            {"last_archived_time": "garbage", "last_failed_time": "2026-11-02T14:32:51+08:00"}))

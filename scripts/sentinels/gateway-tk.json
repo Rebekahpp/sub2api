@@ -123,7 +123,8 @@
         "self.assertNotIn('tokenkey-disk-metrics', prod['paused_jobs'])",
         "def test_bootstrapping_repository_is_advisory_not_a_fault(",
         "def test_bootstrap_reason_without_its_evidence_stays_a_fault(",
-        "def test_check_command_failure_is_a_hard_fault_not_an_advisory("
+        "def test_check_command_failure_is_a_hard_fault_not_an_advisory(",
+        "def test_wal_archive_failing_is_a_hard_fault_with_its_reason_visible("
       ],
       "rationale": "Keep executable coverage, body validation, alert/recovery and retry regressions in the existing host watch test owner. Prod disk-metrics stays an active watched job. Bootstrap advisory and its evidence-forgery guard stay executable."
     },
@@ -18463,13 +18464,16 @@
         "if repo >= 2 and code == 2 and not (info.get(\"backup\") or []):",
         "return \"bootstrapping\"",
         "BOOTSTRAP_REASON = \"repository_bootstrapping\"",
-        "ok = all(states[repo] != \"failed\" for repo in repos) and failed == 0",
         "if ok and bootstrapping:",
         "CHECK_FAILED_REASON = \"check_command_failed\"",
         "def check_failure_detail(message: str, limit: int = 400) -> str:",
-        "except Err as exc:"
+        "except Err as exc:",
+        "def archiver_healthy(arch: dict) -> bool:",
+        "        ok = not broken and archiving_now",
+        "raise Err(\"refusing to write a degraded receipt without a reason\")",
+        "        return _instant(archived) > _instant(failed_at)"
       ],
-      "rationale": "A newly configured pgBackRest repository reports code 2 until its first full lands; check must classify that as bootstrapping, not failure. Both halves of the exemption are load-bearing: `repo >= 2` keeps the primary recovery chain out of it, and the empty-backup test keeps a repository that LOST its chain a failure. Bootstrap is degraded-with-reasons and exits 0; it never excuses a failing archive_command. A check that raises still writes a degraded receipt carrying the pgBackRest error code and HINTs: a MISSING receipt is indistinguishable from a dead timer to the 900s freshness gate, which is strictly worse than a degraded one."
+      "rationale": "A newly configured pgBackRest repository reports code 2 until its first full lands; check must classify that as bootstrapping, not failure. Both halves of the exemption are load-bearing: `repo >= 2` keeps the primary recovery chain out of it, and the empty-backup test keeps a repository that LOST its chain a failure. Bootstrap is degraded-with-reasons and exits 0; it never excuses a failing archive_command. A check that raises still writes a degraded receipt carrying the pgBackRest error code and HINTs: a MISSING receipt is indistinguishable from a dead timer to the 900s freshness gate, which is strictly worse than a degraded one. Archive health is judged on CURRENT state (last_archived_time newer than last_failed_time), never on the cumulative failed_count: those counters never decrease, so `failed_count == 0` asks 'has this host ever failed' and pinned cn-prod to degraded forever after a 3-minute incident. Timestamps are parsed, not string-compared, because equal wall-clock text can carry different UTC offsets. Every non-ok receipt names a reason with a matching evidence object."
     },
     {
       "path": "deploy/tencent/test_tencent_pgbackrest.py",
@@ -18478,7 +18482,10 @@
         "def test_repository_with_backups_reporting_invalid_still_fails(",
         "def test_primary_repository_never_gets_the_bootstrap_exemption(",
         "def test_bootstrap_does_not_excuse_wal_archive_failures(",
-        "def test_check_failure_still_writes_a_diagnosable_receipt("
+        "def test_check_failure_still_writes_a_diagnosable_receipt(",
+        "def test_recovered_host_is_ok_despite_a_nonzero_cumulative_failed_count(",
+        "def test_a_degraded_receipt_always_names_a_reason(",
+        "def test_archiver_healthy_compares_instants_not_strings("
       ],
       "rationale": "Keep the bootstrap-vs-failure boundary executable: exemption applies, exemption refused for a repository with backups, exemption never reaches repo1, and a failing archive_command is never excused."
     },
@@ -18489,13 +18496,16 @@
         "if repo >= 2 and code == 2 and not (info.get(\"backup\") or []):",
         "return \"bootstrapping\"",
         "BOOTSTRAP_REASON = \"repository_bootstrapping\"",
-        "ok = all(states[repo] != \"failed\" for repo in repos) and failed == 0",
         "if ok and bootstrapping:",
         "CHECK_FAILED_REASON = \"check_command_failed\"",
         "def check_failure_detail(message: str, limit: int = 400) -> str:",
-        "except Err as exc:"
+        "except Err as exc:",
+        "def archiver_healthy(arch: dict) -> bool:",
+        "        ok = not broken and archiving_now",
+        "raise Err(\"refusing to write a degraded receipt without a reason\")",
+        "        return _instant(archived) > _instant(failed_at)"
       ],
-      "rationale": "A newly configured pgBackRest repository reports code 2 until its first full lands; check must classify that as bootstrapping, not failure. Both halves of the exemption are load-bearing: `repo >= 2` keeps the primary recovery chain out of it, and the empty-backup test keeps a repository that LOST its chain a failure. Bootstrap is degraded-with-reasons and exits 0; it never excuses a failing archive_command. A check that raises still writes a degraded receipt carrying the pgBackRest error code and HINTs: a MISSING receipt is indistinguishable from a dead timer to the 900s freshness gate, which is strictly worse than a degraded one."
+      "rationale": "A newly configured pgBackRest repository reports code 2 until its first full lands; check must classify that as bootstrapping, not failure. Both halves of the exemption are load-bearing: `repo >= 2` keeps the primary recovery chain out of it, and the empty-backup test keeps a repository that LOST its chain a failure. Bootstrap is degraded-with-reasons and exits 0; it never excuses a failing archive_command. A check that raises still writes a degraded receipt carrying the pgBackRest error code and HINTs: a MISSING receipt is indistinguishable from a dead timer to the 900s freshness gate, which is strictly worse than a degraded one. Archive health is judged on CURRENT state (last_archived_time newer than last_failed_time), never on the cumulative failed_count: those counters never decrease, so `failed_count == 0` asks 'has this host ever failed' and pinned cn-prod to degraded forever after a 3-minute incident. Timestamps are parsed, not string-compared, because equal wall-clock text can carry different UTC offsets. Every non-ok receipt names a reason with a matching evidence object."
     },
     {
       "path": "deploy/domestic/test_cn_pgbackrest.py",
@@ -18504,7 +18514,10 @@
         "def test_repository_with_backups_reporting_invalid_still_fails(",
         "def test_primary_repository_never_gets_the_bootstrap_exemption(",
         "def test_bootstrap_does_not_excuse_wal_archive_failures(",
-        "def test_check_failure_still_writes_a_diagnosable_receipt("
+        "def test_check_failure_still_writes_a_diagnosable_receipt(",
+        "def test_recovered_host_is_ok_despite_a_nonzero_cumulative_failed_count(",
+        "def test_a_degraded_receipt_always_names_a_reason(",
+        "def test_archiver_healthy_compares_instants_not_strings("
       ],
       "rationale": "Keep the bootstrap-vs-failure boundary executable: exemption applies, exemption refused for a repository with backups, exemption never reaches repo1, and a failing archive_command is never excused."
     },
