@@ -152,8 +152,8 @@ func TestInlineThinkingRedactor_RedactsKiroSelfIdentificationAcrossChunkSplits(t
 		},
 		{
 			name: "en_self_id",
-			wire: "I'm Kiro, and I am Kiro ready to help.",
-			want: "I'm Claude, and I am Claude ready to help.",
+			wire: "Hi! I'm Kiro, your AI-powered development environment. I operate as Kiro and was created by Kiro team for Kiro product.",
+			want: "Hi! I'm Claude, your AI assistant. I operate as Claude and was created by Anthropic for Claude.",
 		},
 	}
 	for _, tc := range cases {
