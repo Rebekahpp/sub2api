@@ -76,6 +76,46 @@ def repository_state(repo: int, info: dict) -> str:
     return "failed"
 
 CHECK_FAILED_REASON = "check_command_failed"
+ARCHIVE_FAILING_REASON = "wal_archive_failing"
+REPOSITORY_FAILED_REASON = "repository_failed"
+
+def archiver_healthy(arch: dict) -> bool:
+    """Is WAL archiving working NOW, rather than has it ever failed?
+
+    pg_stat_archiver's archived_count/failed_count are cumulative since
+    stats_reset, so `failed_count == 0` asks "has this host ever failed to
+    archive". cn-prod answered no forever after a 3-minute incident on
+    2026-11-02 left failed_count at 15: every repository read code 0, archiving
+    had long recovered, and the receipt still said degraded on every run.
+    Counters never decrease, so that verdict could not clear without resetting
+    Postgres statistics -- which would also throw away real evidence.
+
+    The producer already knows which signal answers the real question: a
+    last_archived_wal newer than last_failed_wal means the archive_command is
+    succeeding right now. `archiving_now` is computed in SQL (NULL-safe for a
+    host that has never failed); this falls back to the timestamps, then to the
+    cumulative counter, so an older receipt shape is still judged, not crashed.
+    """
+    current = arch.get("archiving_now")
+    if isinstance(current, bool):
+        return current
+    archived, failed_at = arch.get("last_archived_time"), arch.get("last_failed_time")
+    if failed_at is None:
+        return archived is not None
+    if archived is None:
+        return False
+    # Parsed, never compared as strings: equal wall-clock text can carry
+    # different UTC offsets, where lexical order inverts the real one.
+    try:
+        return _instant(archived) > _instant(failed_at)
+    except ValueError:
+        # Unparseable timestamps must not silently pass as healthy.
+        return False
+
+def _instant(value) -> datetime:
+    text = str(value).strip().replace(" ", "T", 1)
+    moment = datetime.fromisoformat(text)
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 def check_failure_detail(message: str, limit: int = 400) -> str:
     """Keep the ERROR/HINT lines that identify the fault; drop the rest.
@@ -201,7 +241,18 @@ def cmd_check():
             "SELECT json_build_object("
             "'last_archived_wal', last_archived_wal, "
             "'last_archived_time', last_archived_time, "
-            "'failed_count', failed_count) FROM pg_stat_archiver;"
+            "'last_failed_wal', last_failed_wal, "
+            "'last_failed_time', last_failed_time, "
+            "'archived_count', archived_count, "
+            "'failed_count', failed_count, "
+            "'stats_reset', stats_reset, "
+            # archived_count/failed_count are CUMULATIVE since stats_reset, so
+            # they answer "has this ever failed", not "is it failing now".
+            # Postgres compares the two timestamps server-side, where a NULL
+            # last_failed_time (never failed) is handled by the COALESCE.
+            "'archiving_now', last_archived_time > "
+            "COALESCE(last_failed_time, '-infinity'::timestamptz)"
+            ") FROM pg_stat_archiver;"
         )
         arch = json.loads(run([
             "docker", "exec", "--user", "postgres", CONTAINER,
@@ -209,12 +260,24 @@ def cmd_check():
         ]))
         infos = {repo: repo_info(repo) for repo in repos}
         states = {repo: repository_state(repo, infos[repo]) for repo in repos}
-        failed = int(arch.get("failed_count") or 0)
         bootstrapping = [repo for repo in repos if states[repo] == "bootstrapping"]
+        broken = [repo for repo in repos if states[repo] == "failed"]
         # WAL archiving is judged separately: bootstrap excuses an uninitialised
         # repository, never a failing archive_command.
-        ok = all(states[repo] != "failed" for repo in repos) and failed == 0
+        archiving_now = archiver_healthy(arch)
+        ok = not broken and archiving_now
         completed = time.time()
+        # Every non-ok receipt must name a reason. A bare "degraded" tells the
+        # watcher something is wrong but not what, which is barely better than a
+        # missing receipt -- and it is exactly what cn-prod reported after its
+        # cumulative failed_count made an already-recovered host look broken.
+        reasons = []
+        if broken:
+            reasons.append(REPOSITORY_FAILED_REASON)
+        if not archiving_now:
+            reasons.append(ARCHIVE_FAILING_REASON)
+        if ok and bootstrapping:
+            reasons.append(BOOTSTRAP_REASON)
         receipt = {
             "schema_version": 1,
             "status": "ok" if ok and not bootstrapping else "degraded",
@@ -231,16 +294,27 @@ def cmd_check():
                 {"repo": repo, "status": states[repo]} for repo in repos
             ],
         }
+        if reasons:
+            receipt["reasons"] = reasons
+        if broken:
+            receipt[REPOSITORY_FAILED_REASON] = {"repositories": broken}
+        if not archiving_now:
+            receipt[ARCHIVE_FAILING_REASON] = {
+                "last_archived_wal": arch.get("last_archived_wal"),
+                "last_failed_wal": arch.get("last_failed_wal"),
+                "last_failed_time": arch.get("last_failed_time"),
+            }
         if ok and bootstrapping:
             # host_https_watch.physical_backup_fact downgrades a degraded receipt
             # to a warning only when every reason has a matching evidence object
             # that is itself ok and completed; see its `evidence` mapping.
-            receipt["reasons"] = [BOOTSTRAP_REASON]
             receipt[BOOTSTRAP_REASON] = {
                 "status": "ok",
                 "completed_at": completed,
                 "repositories": bootstrapping,
             }
+        if receipt["status"] != "ok" and not receipt.get("reasons"):
+            raise Err("refusing to write a degraded receipt without a reason")
         atomic_json(STATE / "archive_check.json", receipt)
         print(json.dumps(receipt))
         if not ok:
